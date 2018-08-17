@@ -78,38 +78,57 @@ bool isValidmDNSName(String mdns_name) {
 
 WiFiServer server(23);
 WiFiClient serverClient;
+
+WiFiEventHandler stationConnectedHandler;
+void onStationConnected(const WiFiEventSoftAPModeStationConnected& evt) {
+    server.begin();
+    server.setNoDelay(true);
+}
+
+
 #endif
 
 void handleReset()
 {
-#if defined(ESP8266)
 	// The asm volatile method doesn't work on ESP8266. Instead, use ESP.restart
 	ESP.restart();
-#else
-	// resetting using the watchdog timer (which is a full reset of all registers) 
-	// might not be compatible with old Arduino bootloaders. jumping to 0 is safer.
-	asm volatile ("  jmp 0");
-#endif
 }
 
 
 
 void setup()
 {
+    // Let's get the display going so that we can provide the user a bit of feedback on what's happening
+    display.init();
+    display.printEEPROMStartup();
 
+    // Before anything else, let's get SPIFFS working. We need to start it up, and then test if the file system was
+    // formatted.
+	SPIFFS.begin();
+
+    if (!SPIFFS.exists("/formatComplete.txt")) {
+        if (!SPIFFS.exists("/mdns.txt")) {
+            // This prevents installations that are being upgraded from v0.10 to v0.11 from having their mdns settings
+            // wiped out
+            SPIFFS.format();
+        }
+        File f = SPIFFS.open("/formatComplete.txt", "w");
+        f.close();
+    }
 
 #ifdef ESP8266_WiFi
+    display.printWiFiStartup();
 	String mdns_id;
 
 	mdns_id = eepromManager.fetchmDNSName();
-	if(mdns_id.length()<=0)
-		mdns_id = "ESP" + String(ESP.getChipId());
+//	if(mdns_id.length()<=0)
+//		mdns_id = "ESP" + String(ESP.getChipId());
 
 
 	// If we're going to set up WiFi, let's get to it
 	WiFiManager wifiManager;
 	wifiManager.setConfigPortalTimeout(5*60); // Time out after 5 minutes so that we can keep managing temps 
-	wifiManager.setDebugOutput(false); // In case we have a serial connection to BrewPi
+	wifiManager.setDebugOutput(FALSE); // In case we have a serial connection to BrewPi
 									   
 	// The main purpose of this is to set a boolean value which will allow us to know we
 	// just saved a new configuration (as opposed to rebooting normally)
@@ -120,23 +139,32 @@ void setup()
 	WiFiManagerParameter custom_mdns_name("mdns", "Device (mDNS) Name", mdns_id.c_str(), 20);
 	wifiManager.addParameter(&custom_mdns_name);
 
-	wifiManager.autoConnect(); // Launch captive portal with auto generated name ESP + ChipID
+//	wifiManager.autoConnect("ESP-BrewPi-Setup"); // Launch captive portal with static name
+    // Launch captive portal with auto generated name ESP + ChipID
+    if(wifiManager.autoConnect()) {
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_AP_STA);
+    } else {
+        // We failed to connect - turn WiFi off
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_OFF);
+    }
 
-	// Alright. We're theoretically connected here (or we timed out).
-	// If we connected, then let's save the mDNS name
-	if (shouldSaveConfig) {
-		// If the mDNS name is valid, save it.
-		if (isValidmDNSName(custom_mdns_name.getValue())) {
-			eepromManager.savemDNSName(custom_mdns_name.getValue());
-		} else {
-			// If the mDNS name is invalid, reset the WiFi configuration and restart the ESP8266
-			WiFi.disconnect(true);
-			delay(2000);
-			handleReset();
-		}
-	}
+    // Alright. We're theoretically connected here (or we timed out).
+    // If we connected, then let's save the mDNS name
+    if (shouldSaveConfig) {
+        // If the mDNS name is valid, save it.
+        if (isValidmDNSName(custom_mdns_name.getValue())) {
+            eepromManager.savemDNSName(custom_mdns_name.getValue());
+        } else {
+            // If the mDNS name is invalid, reset the WiFi configuration and restart the ESP8266
+            WiFi.disconnect(true);
+            delay(2000);
+            handleReset();
+        }
+    }
 
-	// Regardless of the above, we need to set the mDNS name and announce it
+    // Regardless of the above, we need to set the mDNS name and announce it
 	if (!MDNS.begin(mdns_id.c_str())) {
 		// TODO - Do something about it or log it or something
 	}
@@ -167,11 +195,12 @@ void setup()
 	MDNS.addServiceTxt("brewpi", "tcp", "revision", FIRMWARE_REVISION);
 #endif
 
-    bool initialize = !eepromManager.hasSettings();
-    if(initialize) {
-        eepromManager.zapEeprom();  // Writes all the empty files to SPIFFS
-        logInfo(INFO_EEPROM_INITIALIZED);
-    }
+	// This code no longer really does anything.
+//    bool initialize = !eepromManager.hasSettings();
+//    if(initialize) {
+//        eepromManager.zapEeprom();  // Writes all the empty files to SPIFFS
+//        logInfo(INFO_EEPROM_INITIALIZED);
+//    }
 
 	logDebug("started");
 	tempControl.init();
@@ -184,12 +213,13 @@ void setup()
 	tempControl.fridgeSensor->init();
 #endif	
 
-	display.init();
 #ifdef ESP8266_WiFi
 	display.printWiFi();  // Print the WiFi info (mDNS name & IP address)
+    WiFi.setAutoReconnect(true);
+    stationConnectedHandler = WiFi.onSoftAPModeStationConnected(&onStationConnected);
 	delay(8000);
-	display.clear();
 #endif
+	display.clear();
 	display.printStationaryText();
 	display.printState();
 
@@ -199,27 +229,26 @@ void setup()
 }
 
 #ifdef ESP8266_WiFi
-void connectClients() {
+	int reconnectPoll = 0;
+	void connectClients() {
 
-    if(WiFi.status() != WL_CONNECTED){
-        WiFi.begin();
+    if(WiFi.isConnected()) {
+        if (server.hasClient()) {
+            // If we show a client as already being disconnected, force a disconnect
+            if (serverClient) serverClient.stop();
+            serverClient = server.available();
+            serverClient.flush();
+        }
+    } else {
+        // This might be unnecessary, but let's go ahead and disconnect any "clients" we show as connected given that
+        // WiFi isn't connected
+		// If we show a client as already being disconnected, force a disconnect
+		if (serverClient) {
+			serverClient.stop();
+			serverClient = server.available();
+			serverClient.flush();
+		}
     }
-
-	if (server.hasClient()) {
-        // If we show a client as already being disconnected, force a disconnect
-        if (serverClient) serverClient.stop();
-		serverClient = server.available();
-		serverClient.flush();
-
-//        if (!serverClient || !serverClient.connected()) {
-//			if (serverClient) serverClient.stop();  // serverClient isn't connected
-//			serverClient = server.available();
-//            serverClient.flush(); // Clean things up
-//		} else {
-//			// no free/disconnected spot so reject
-//			server.available().stop();
-//		}
-	}
 }
 
 #endif
@@ -227,9 +256,20 @@ void connectClients() {
 void brewpiLoop(void)
 {
 	static unsigned long lastUpdate = 0;
-	uint8_t oldState;
+    static unsigned long lastLcdUpdate = 0;
 
-	if (ticks.millis() - lastUpdate >= (1000)) { //update settings every second
+	uint8_t oldState;
+    if(ticks.millis() - lastLcdUpdate >= (180000)) { //reset lcd every 180 seconds as a workaround for screen scramble
+        lastLcdUpdate = ticks.millis();
+
+        display.init();
+        display.printStationaryText();
+        display.printState();
+
+        rotaryEncoder.init();
+    }
+
+    if (ticks.millis() - lastUpdate >= (1000)) { //update settings every second
 		lastUpdate = ticks.millis();
 
 #if BREWPI_BUZZER
