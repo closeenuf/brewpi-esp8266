@@ -1,0 +1,16 @@
+.pioenvs
+CMakeListsPrivate.txt
+.piolibdeps
+.vscode/c_cpp_properties.json
+.vscode/.browse.c_cpp.db*
+.vscode/launch.json
+
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
