@@ -127,8 +127,8 @@
 // Enable the LCD display. Without this, a NullDisplay is used
 //
 #ifndef BREWPI_LCD
-#define BREWPI_LCD 1
-#define BREWPI_IIC 1
+#define BREWPI_LCD 0
+//#define BREWPI_IIC 1
 #define BACKLIGHT_AUTO_OFF_PERIOD 0 // Disable backlight auto off
 #endif
 //
